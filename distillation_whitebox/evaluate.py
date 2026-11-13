@@ -115,7 +115,9 @@ def evaluate(
 
         s_shift = s_logits[:, :-1, :][:, :, t_al.shrink_ids].float()
         t_shift = t_al.logits[:, :-1, :].float()
-        mask = t_al.mask[:, 1:].float()
+        # mask 必须与 t_shift 同步用 [:-1]，否则错位一位，
+        # 会把教师 logits 未对齐（全零）的位置也计入 KL。
+        mask = t_al.mask[:, :-1].float()
 
         log_pt = F.log_softmax(t_shift / temperature, dim=-1)
         log_ps = F.log_softmax(s_shift / temperature, dim=-1)

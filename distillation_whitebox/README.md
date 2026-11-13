@@ -126,6 +126,80 @@ D:\models\models\Qwen--Qwen3-0.6B\snapshots\master
 
 可用环境变量 `XLLM_TEACHER_PATH` 覆盖。
 
+### 推理
+
+训练完成后用 `infer.py` 加载蒸馏权重做对话。它独立于 `evaluate.py`，
+支持三种模式：
+
+```bash
+cd distillation_whitebox
+
+# 单条提问
+python infer.py --prompt "你是谁？"
+
+# 与基线对照（验证蒸馏确实改变了行为）
+python infer.py --weight full_sft --prompt "你是谁？"
+
+# 交互式多轮（保留历史，exit 退出 / clear 清空）
+python infer.py --chat
+
+# 批量：每行一个提问
+python infer.py --input questions.txt --output answers.jsonl --batch_size 4
+
+# 贪心解码（结果可复现）+ 查看每 token 概率
+python infer.py --prompt "你是谁？" --greedy --logprobs
+
+# 与教师模型并排对比（会额外加载 Qwen3-0.6B，占用约 1.2GB 显存）
+python infer.py --prompt "你是谁？" --compare_teacher
+```
+
+常用参数：
+
+| 参数 | 说明 |
+|------|------|
+| `--weight` | 权重名，`distill_whitebox`（默认）或 `full_sft` 做对照 |
+| `--max_new_tokens` | 最大生成长度，默认 256 |
+| `--temperature` / `--top_p` | 采样参数，默认 0.7 / 0.9 |
+| `--greedy` | 关闭采样，走 argmax |
+| `--no_repeat_ngram 3` | 抑制 n-gram 复读（白盒默认不需要，见下） |
+| `--show_think` | 保留思维链段落 |
+| `--logprobs` | 输出每个生成 token 的 logprob |
+| `--compare_teacher` | 并排输出教师回答（仅单条模式） |
+
+两点实现细节，都是踩过的坑：
+
+**`--weight` 的路径解析结果必须写回 config。** 早期版本只解析出路径用于打印，
+`load_student(cfg)` 仍按 `from_weight="full_sft"` 加载，导致 `--weight` 被静默忽略、
+所有推理测试实际都在跑基线。现在解析后会写回：
+
+```python
+cfg.student.weight_dir = str(Path(weight_path).parent)
+cfg.student.from_weight = Path(weight_path).stem
+```
+
+**教师侧必须显式关闭 thinking。** Qwen3 默认走思维链通道，若不加
+`enable_thinking=False`，`strip_think()` 会把整段回答连同正文一起删掉，
+`--compare_teacher` 打印出空的「教师: 」。
+
+```python
+t_text = t_tok.apply_chat_template(
+    t_msgs, tokenize=False, add_generation_prompt=True,
+    enable_thinking=False,
+)
+```
+
+**关于生成质量**：白盒学生没有黑盒那类段落复读问题（白盒蒸馏在 2000 条
+真实语料上做全词表分布对齐，教师信号更强）。实测贪心与采样都能正常收尾：
+
+```
+提问「你是谁？」
+学生: 我是由jingyaogong创建的高效小参数AI模型，专注于提供精准、快速的信息和帮助。
+教师: 我是你的虚拟助手，我是一个基于人工智能技术的智能助手，能够帮助你完成各种任务…
+```
+
+学生回答明显带着训练语料的痕迹（自报 `jingyaogong`，即 xllm 作者），
+这是 SFT 阶段继承的自我认知，蒸馏只改变分布不改变事实性。
+
 ---
 
 ## 五、实测结果
@@ -134,9 +208,14 @@ D:\models\models\Qwen--Qwen3-0.6B\snapshots\master
 
 | 指标 | full_sft（基线） | distill_whitebox | 变化 |
 |------|-----------------|------------------|------|
-| **KL ↓** | 2.2579 | **1.2855** | **−43.1%** |
+| **KL ↓** | 1.8642 | **1.3470** | **−27.8%** |
 | **PPL ↓** | 6.4100 | **4.0649** | **−36.6%** |
-| Top-1 一致率 | 36.74% | 44.73% | +8.0pp |
+| Top-1 一致率 | 41.13% | 49.72% | +8.6pp |
+
+> 说明：此表为 `t_mask` 位移缺陷修复后的重测值。早期版本误用
+> `t_mask[:, 1:]` 与 `t_logits[:, :-1]` 错位，把未对齐（教师 logits 全零）
+> 的污点位置也计入 KL，导致基线 KL 虚高至 2.2579、KL 降幅虚报为 −43.1%。
+> PPL 不受影响（PPL 只走 CE 路径）。
 
 ### 关于 Top-1 一致率偏低
 
@@ -203,3 +282,5 @@ snapshot_download("Qwen/Qwen3-0.6B", cache_dir=r"D:\models")
 | `student_loader.py` | 学生加载（自动修正键名缺陷） |
 | `train_kd.py` | 训练主流程 |
 | `evaluate.py` | 评估（KL / Top-1 / PPL / 生成样例） |
+| `infer.py` | **推理**（单条 / 交互 / 批量，可与教师并排对比） |
+| `trace_demo.py` | 单样本 CE/KL 逐位置追踪（讲解用，不参与训练） |

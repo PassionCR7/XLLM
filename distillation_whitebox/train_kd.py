@@ -177,9 +177,13 @@ def kd_step(
                     )
 
         # ---------- 对齐到"预测下一个 token" ----------
-        # 位置 i 的 logits 预测 i+1；教师 mask 同样右移一位
+        # 位置 i 的 logits 预测 i+1，因此 logits 取 [:-1] 配 token [1:]。
+        # 关键：t_mask 必须与 t_logits 使用**同一个** [:-1] 位移。
+        # 早期实现误用 t_mask[:, 1:]，导致 mask 与 logits 错开一位，
+        # 会把「教师 logits 为 0（未对齐）」的污点位置当作有效样本纳入 KL，
+        # 既不报错也不崩溃，只是静默抬高 KL 数值。
         t_shift = t_logits[:, :-1, :]
-        t_mask_shift = t_mask[:, 1:]              # [B, L-1]
+        t_mask_shift = t_mask[:, :-1]             # [B, L-1]
         s_shift = s_logits[..., :-1, :]
 
         # 学生在被覆盖子集上的 logits
