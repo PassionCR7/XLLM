@@ -57,7 +57,7 @@ def main():
         type=str,
         help="模型加载路径（model=原生torch权重，其他路径=transformers格式）",
     )
-    parser.add_argument("--save_dir", default="out", type=str, help="模型权重目录")
+    parser.add_argument("--save_dir", default="checkpoints", type=str, help="模型权重目录")
     parser.add_argument(
         "--weight",
         default="pretrain",
