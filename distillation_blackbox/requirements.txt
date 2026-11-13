@@ -1,0 +1,10 @@
+# 黑盒蒸馏依赖
+# 学生模型与训练框架复用项目根目录依赖，此处只列本目录额外需要的能力。
+# 已实测可用的环境：D:\Anaconda2025\envs\py11\python.exe
+
+torch>=2.5.0
+transformers>=4.40.0
+datasets>=2.19.0
+
+# 教师 API 走标准库 urllib，无需额外 HTTP 客户端
+# （不引入 openai/httpx，减少依赖面）

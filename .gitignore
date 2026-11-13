@@ -1,1 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 蒸馏：教师 logits 缓存（体积大，可由训练脚本自动重建）
+distillation_whitebox/teacher_cache/
+
+# 蒸馏：训练产物权重
+distillation_blackbox/out/
+distillation_whitebox/out/
+
+# 蒸馏：教师生成数据（可由 gen_data.py 重新拉取）
+distillation_blackbox/data/teacher_sft.jsonl
+
+# 注：reports/ 下的评估结果体积小（约 2KB），保留入库作为交付证据
+
+# IDE
 /.idea
