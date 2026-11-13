@@ -23,3 +23,8 @@ distillation_blackbox/data/teacher_sft.jsonl
 
 # IDE
 /.idea
+
+# 爬虫产出数据（体积随抓取增长，可由 data_gen 重新生成）
+data_gen/out/raw/
+data_gen/out/corpus/
+data_gen/out/state.json
