@@ -304,6 +304,13 @@ class BlackboxDistillDataset(Dataset):
                         merged[sid] = merged.get(sid, 0.0) + math.exp(lp)
                 if not merged:
                     continue
+                # 质量门控：若 top-k 里只有极低概率的候选能映射到学生单 token
+                # （典型情形是教师 top-1 本身是多 token，如 '哈哈' -> '哈','哈'），
+                # 剩余质量 p_bg ≈ 1，KL 退化为常数 (log p_bg - log q_bg)，
+                # 对参数没有梯度贡献，却会被计入分母稀释有效信号。
+                # 实测约 17% 的教师 token 属此类，直接舍弃。
+                if sum(merged.values()) < 1e-2:
+                    continue
                 items = sorted(merged.items(), key=lambda kv: -kv[1])[:5]
                 ids_row = [sid for sid, _ in items] + [-1] * (5 - len(items))
                 prb_row = [p for _, p in items] + [0.0] * (5 - len(items))

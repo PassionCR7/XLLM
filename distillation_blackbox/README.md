@@ -250,6 +250,71 @@ from modelscope import snapshot_download
 snapshot_download("Qwen/Qwen3-0.6B", cache_dir=r"D:\models")
 ```
 
+### 6. 推理
+
+训练完成后用 `infer.py` 加载蒸馏权重做对话。它独立于 `evaluate.py`，
+支持三种模式：
+
+```bash
+cd distillation_blackbox
+
+# 单条提问
+python infer.py --prompt "你是谁？"
+
+# 与基线对照（验证蒸馏确实改变了行为）
+python infer.py --weight full_sft --prompt "你是谁？"
+
+# 交互式多轮（保留历史，exit 退出 / clear 清空）
+python infer.py --chat
+
+# 批量：每行一个提问
+python infer.py --input questions.txt --output answers.jsonl --batch_size 8
+
+# 贪心解码（结果可复现）+ 查看每 token 概率
+python infer.py --prompt "你是谁？" --greedy --logprobs
+```
+
+常用参数：
+
+| 参数 | 说明 |
+|------|------|
+| `--weight` | 权重名，`distill_blackbox`（默认）或 `full_sft` 做对照 |
+| `--max_new_tokens` | 最大生成长度，默认 256 |
+| `--temperature` / `--top_p` | 采样参数，默认 0.7 / 0.9 |
+| `--greedy` | 关闭采样，走 argmax |
+| `--no_repeat_ngram 3` | 抑制复读（小模型常见问题） |
+| `--show_think` | 保留思维链段落 |
+| `--logprobs` | 输出每个生成 token 的 logprob |
+
+注意：`--weight` 的路径解析结果会写回 config 后再加载。早期版本只解析不写回，
+导致 `--weight` 被静默忽略、所有请求实际都在加载 `full_sft`——这个坑已修。
+
+**关于复读**：这个 25.83M 学生只用 300 条教师数据蒸馏，贪心解码下容易出现
+段落级自我重复（把同一句话连着输出三遍）。实测各方案效果：
+
+| 做法 | 效果 | 副作用 |
+|------|------|--------|
+| 默认（采样 T=0.7, top_p=0.9） | 不出现整段复读 | 输出随机，后半段偶尔跑题 |
+| `--repetition_penalty 1.15` | **仍复读**，只是每遍内容略变 | 无 |
+| `--repetition_penalty 1.3` | **完全消除**，行文连贯 | 语气变浮夸，夹带 emoji |
+| `--no_repeat_ngram 3` | 消除逐字重复 | 贪心+强抑制下会编造事实 |
+
+实测同一提问「你是谁？」，贪心解码：
+
+```
+无抑制            → "我是…minimind，由中国的个人开发者独立开发。" 重复 3 遍
+penalty=1.15      → 仍然重复 3 遍（每遍措辞微调），等于无效
+penalty=1.3       → 单段完整回答，不复读，但出现 😊🌟🎉
+ngram=3           → 不复读，但后半段编造"基于阿里云的智能助手"
+```
+
+**推荐**：日常对话用默认采样即可；要可复现的结果用
+`--greedy --repetition_penalty 1.3`。注意 `penalty=1.15` 这个常见推荐值
+在本模型上不起作用，需要到 1.3 才生效。
+
+根因是数据量太少（300 条）而非解码配置，调参只能缓解表象。
+要提高生成质量需要扩充教师数据或增大训练轮数。
+
 ---
 
 ## 四、文件清单
@@ -263,6 +328,8 @@ snapshot_download("Qwen/Qwen3-0.6B", cache_dir=r"D:\models")
 | `gen_data.py` | 生成教师数据（质量门控 + 断点续生成） |
 | `train_kd.py` | 训练（序列级 + 稀疏 logprob 软标签） |
 | `evaluate.py` | 评估（PPL + 生成样例） |
+| `infer.py` | **推理**（单条 / 交互 / 批量，支持 logprob 输出） |
+| `trace_demo.py` | 单样本 CE/KL 逐位置追踪（讲解用，不参与训练） |
 
 ### `distillation_whitebox/`
 
@@ -275,6 +342,8 @@ snapshot_download("Qwen/Qwen3-0.6B", cache_dir=r"D:\models")
 | `student_loader.py` | 学生加载（自动修正键名缺陷） |
 | `train_kd.py` | 训练（KL + CE 联合损失） |
 | `evaluate.py` | 评估（KL / Top-1 / PPL） |
+| `infer.py` | **推理**（单条 / 交互 / 批量，可与教师并排对比） |
+| `trace_demo.py` | 单样本 CE/KL 逐位置追踪（讲解用，不参与训练） |
 
 ---
 
@@ -299,12 +368,15 @@ supports_logprobs=True, logprob_valid_ratio=1.0
 - top-k → 学生单 token 映射率 **55.8%**
 - assistant token 实际命中 **68~78%**
 - 概率分布合理（如"我" p=0.946，背景质量 0.053）
+- 质量门控：`Σp_topk < 0.01` 的位置直接舍弃（实测占教师 token 的 **17.3%**）。
+  这类位置通常是教师 top-1 本身就是多 token（如 `'哈哈'` → `'哈','哈'`），
+  剩余质量 `p_bg ≈ 1`，KL 退化为常数、对参数无梯度贡献，却会稀释分母。
 
 ### 白盒（对照参考）
 
 | 指标 | 基线 | distill_whitebox | 变化 |
 |------|------|------------------|------|
-| KL ↓ | 2.2579 | 1.2855 | −43.1% |
+| KL ↓ | 1.8642 | 1.3470 | −27.8% |
 | PPL ↓ | 6.4100 | 4.0649 | −36.6% |
 
 > 两套 PPL 不可直接比较：黑盒在教师生成的 300 条数据上评估，
