@@ -30,6 +30,10 @@ from trainer.trainer_utils import (
 warnings.filterwarnings("ignore")
 
 
+# 记录当前训练进度，供 Ctrl+C 优雅退出时保存
+_rl_state = {"epoch": 0, "step": 0}
+
+
 def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
     def reasoning_model_reward(rewards_tensor):
         pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
@@ -115,6 +119,8 @@ def grpo_train_epoch(
     wandb=None,
 ):
     for step, batch in enumerate(loader, start=start_step + 1):
+        _rl_state["step"] = step
+        _rl_state["epoch"] = epoch
         prompts = batch["prompt"]
 
         prompt_inputs = tokenizer(
@@ -210,7 +216,8 @@ def grpo_train_epoch(
 
         kl_div = ref_per_token_logps - per_token_logps
         per_token_kl = torch.exp(kl_div) - kl_div - 1
-        # 重要性比率：exp(新策略logp - 旧策略logp)，旧策略logp在rollout时捕获
+        # 重要性比率（CISPO 分支使用）：r_t = exp(新策略logp - 旧策略logp)，旧策略logp在rollout时捕获；
+        #   PPO-clip 分支不用它（PPO-clip 按用户指定公式改用 π_θ/π_ref，见下方 else 分支）。
         ratio = torch.exp(per_token_logps - old_per_token_logps)
         if args.loss_type == "cispo":
             # ================= CISPO (Clipped Importance Sampling-weight Policy Optimization) =================
@@ -237,25 +244,34 @@ def grpo_train_epoch(
             #   advantages.unsqueeze(1)：把 [B] 扩成 [B,1]，与 token 维度 [B,T] 广播相乘
             #   外层负号把 -beta*KL 变成 +beta*KL：即对偏离参考策略 ref_model 的行为施加惩罚
             #   注：原论文 CISPO 不含 KL 项；此处保留 beta*KL 是复现代码的工程取舍，可传 --beta 0 关闭。
-            # -------- 对照参考：若此处改为手动写 PPO-clip（而不走下方 else 分支），对应代码如下 --------
-            # # PPO-clip 目标（DeepSeekMath GRPO 的核心）：
-            # #   L = min( r*Â,  clip(r, 1-eps, 1+eps)*Â )  - beta*KL
-            # # min 双分支的隐式 mask：当 Â>0 且 r>1+eps（或 Â<0 且 r<1-eps）时，min 取到不依赖 θ 的常数分支，
-            # #   该 token 的梯度被清零（被"丢弃"）——这正是 CISPO 要避免的：CISPO 只封顶权重、从不把梯度归零。
-            # clipped_ratio = torch.clamp(ratio, 1 - args.epsilon, 1 + args.epsilon)
-            # per_token_loss1 = ratio * advantages.unsqueeze(1)          # 未裁剪项 r*Â
-            # per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)  # 裁剪项 clip(r)*Â
-            # per_token_loss = -(torch.min(per_token_loss1, per_token_loss2) - args.beta * per_token_kl)
+            # -------- 与下方 else 分支（PPO-clip）的对照 --------
+            # 下方 else 分支即 PPO-clip 实现（r_t = π_θ/π_ref，min 双分支掩码）：
+            #   PPO-clip：超界 token 的梯度被清零（被"丢弃"）；CISPO：只封顶权重、梯度从不归零。
         else:
-            # GRPO（PPO-clip 风格，与上方"注释对照代码"逻辑等价，通过 --loss_type grpo 启用）：
-            #   min(ratio, clipped(ratio))*Â - beta*KL；超界 token 的梯度被 mask 清零（与 CISPO 的关键差异）
+            # ================ PPO-clip 目标（GRPO，按用户指定公式实现）================
+            # 公式：L_GRPO = -1/|T| Σ_t [ min( r_t·A_t,  clip(r_t,1-ε,1+ε)·A_t ) - β·KL(π_θ || π_ref) ]
+            #   r_t = π_θ(o_t|q) / π_ref(o_t|q) = exp(新策略logp - 参考模型logp)
+            # 关键修正：分母从"rollout 旧策略"改为"参考模型 ref_model"，
+            #   因此 r_t 不会恒等于 1 → PPO 的 clip 与信任区间真正生效（解决此前 on-policy 单步下 ratio≡1、梯度消失的问题）。
+            ratio = torch.exp(per_token_logps - ref_per_token_logps)  # r_t = π_θ / π_ref
             clipped_ratio = torch.clamp(ratio, 1 - args.epsilon, 1 + args.epsilon)
+            # 未裁剪项：r_t · A_t
             per_token_loss1 = ratio * advantages.unsqueeze(1)
+            # 裁剪项：clip(r_t, 1-ε, 1+ε) · A_t
             per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)
+            # min 双分支（隐式信任区间 mask）：当 A>0 且 r>1+ε（或 A<0 且 r<1-ε）时 min 取到常数分支，
+            #   该 token 梯度被清零（被"丢弃"）——这正是 PPO-clip 与 CISPO 的本质差异。
             per_token_loss = -(
                 torch.min(per_token_loss1, per_token_loss2) - args.beta * per_token_kl
             )
+            # 外层负号把"最大化目标"转成"最小化 loss"；-β·KL 变 +β·KL，即惩罚偏离参考策略 π_ref。
 
+        # ============ 总 loss 构建（CISPO / PPO-clip 共用，对应公式前的 -1/|T| Σ_t）============
+        # ① 逐 token loss 先乘 completion_mask（屏蔽 eos 之后与 padding 的 token）
+        # ② 按序列做有效 token 平均：1/|T_i| Σ_t (per_token_loss·mask)   ← 即公式中的 1/|T| Σ_t
+        # ③ 再对 batch 内所有序列取 mean（跨 prompt 平均）
+        # ④ 除以 accumulation_steps：loss.backward() 每个 step 都调用，梯度累积 N 次后才 optimizer.step()，
+        #    此处归一化保证单次更新的梯度尺度与 batch 一致
         loss = (
             (per_token_loss * completion_mask).sum(dim=1)
             / completion_mask.sum(dim=1).clamp(min=1)
@@ -502,49 +518,82 @@ if __name__ == "__main__":
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
 
-    for epoch in range(start_epoch, args.epochs):
-        train_sampler and train_sampler.set_epoch(epoch)
+    try:
+        for epoch in range(start_epoch, args.epochs):
+            train_sampler and train_sampler.set_epoch(epoch)
 
-        if epoch == start_epoch and start_step > 0:
-            batch_sampler = SkipBatchSampler(
-                train_sampler or range(len(train_ds)), args.batch_size, start_step
-            )
-            loader = DataLoader(
-                train_ds,
-                batch_sampler=batch_sampler,
-                num_workers=args.num_workers,
-                pin_memory=True,
-            )
-            Logger(
-                f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
-            )
-            grpo_train_epoch(
-                epoch,
-                loader,
-                len(loader) + start_step,
-                ref_model,
-                reward_model,
-                reward_tokenizer,
-                start_step,
-                wandb,
-            )
-        else:
-            loader = DataLoader(
-                train_ds,
-                batch_size=args.batch_size,
-                pin_memory=True,
-                drop_last=False,
-                shuffle=(train_sampler is None),
-                num_workers=args.num_workers,
-                sampler=train_sampler,
-            )
-            grpo_train_epoch(
-                epoch,
-                loader,
-                len(loader),
-                ref_model,
-                reward_model,
-                reward_tokenizer,
-                0,
-                wandb,
-            )
+            if epoch == start_epoch and start_step > 0:
+                batch_sampler = SkipBatchSampler(
+                    train_sampler or range(len(train_ds)), args.batch_size, start_step
+                )
+                loader = DataLoader(
+                    train_ds,
+                    batch_sampler=batch_sampler,
+                    num_workers=args.num_workers,
+                    pin_memory=True,
+                )
+                Logger(
+                    f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
+                )
+                grpo_train_epoch(
+                    epoch,
+                    loader,
+                    len(loader) + start_step,
+                    ref_model,
+                    reward_model,
+                    reward_tokenizer,
+                    start_step,
+                    wandb,
+                )
+            else:
+                loader = DataLoader(
+                    train_ds,
+                    batch_size=args.batch_size,
+                    pin_memory=True,
+                    drop_last=False,
+                    shuffle=(train_sampler is None),
+                    num_workers=args.num_workers,
+                    sampler=train_sampler,
+                )
+                grpo_train_epoch(
+                    epoch,
+                    loader,
+                    len(loader),
+                    ref_model,
+                    reward_model,
+                    reward_tokenizer,
+                    0,
+                    wandb,
+                )
+    except KeyboardInterrupt:
+        # Ctrl+C 优雅退出：把当前权重与续训点完整保存后再退出
+        Logger(
+            f"KeyboardInterrupt 收到，正在保存当前权重（Epoch {_rl_state['epoch'] + 1}, Step {_rl_state['step']}）..."
+        )
+        model.eval()
+        moe_suffix = "_moe" if lm_config.use_moe else ""
+        ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+        state_dict = (
+            model.module.state_dict()
+            if isinstance(model, DistributedDataParallel)
+            else model.state_dict()
+        )
+        torch.save({k: v.half() for k, v in state_dict.items()}, ckp + ".tmp")
+        os.replace(ckp + ".tmp", ckp)
+        lm_checkpoint(
+            lm_config,
+            weight=args.save_weight,
+            model=model,
+            optimizer=optimizer,
+            epoch=_rl_state["epoch"],
+            step=_rl_state["step"],
+            wandb=wandb,
+            save_dir="../checkpoints",
+            scheduler=scheduler,
+        )
+        model.train()
+        Logger(
+            f"已保存 {ckp} 与 checkpoints/{args.save_weight}_{lm_config.hidden_size}_resume.pth，"
+            "之后可用 --from_resume=1 从该点续训"
+        )
+        raise SystemExit(0)
