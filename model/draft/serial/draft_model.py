@@ -32,8 +32,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from ..XLLMModel import XLLMConfig, XLLMForCausalLM
-from ._verification import prepare_distribution, sample_token
+from ...XLLMModel import XLLMConfig, XLLMForCausalLM
+from ..common._verification import prepare_distribution, sample_token
 
 
 class DraftModel(nn.Module):

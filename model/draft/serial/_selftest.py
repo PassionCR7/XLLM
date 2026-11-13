@@ -10,16 +10,30 @@ _selftest.py —— 推测解码链路自测
 """
 
 import os
+import pathlib
 import sys
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+def _find_repo_root(start=None):
+    """向上定位仓库根目录（含 model/ 与 trainer/ 的那一层）。
+
+    用标志目录而不是固定层数：本文件曾被移动过目录层级，硬编码 dirname 次数
+    会在下次挪动时静默指错路径，进而把 ckpt / dataset 全解析到错误位置。
+    """
+    p = pathlib.Path(start or __file__).resolve().parent
+    for cand in [p, *p.parents]:
+        if (cand / "model").is_dir() and (cand / "trainer").is_dir():
+            return str(cand)
+    return str(p.parents[1])
+
+
+_REPO_ROOT = _find_repo_root()
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import torch
 
 from model.XLLMModel import XLLMConfig, XLLMForCausalLM
-from model.draft import DraftModel, SpeculativeDecodingEngine
+from model.draft.serial import DraftModel, SpeculativeDecodingEngine
 
 
 def vanilla_greedy(model, input_ids, max_new, eos):

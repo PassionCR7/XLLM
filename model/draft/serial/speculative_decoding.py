@@ -35,8 +35,8 @@ from typing import Optional
 
 import torch
 
-from ..XLLMModel import XLLMForCausalLM
-from ._verification import acceptance_stats, verify_and_sample
+from ...XLLMModel import XLLMForCausalLM
+from ..common._verification import acceptance_stats, verify_and_sample
 from .draft_model import DraftModel
 
 
@@ -78,7 +78,7 @@ class SpeculativeDecodingEngine:
         self.top_p = top_p
         self.eos_token_id = eos_token_id
 
-        self.rng = torch.Generator()
+        self.rng = torch.Generator(device=self._infer_device(target))
         if seed is not None:
             self.rng.manual_seed(seed)
 
@@ -93,6 +93,17 @@ class SpeculativeDecodingEngine:
     # ------------------------------------------------------------------
     # 工具：KV cache 修剪（按绝对序列长度 keep_len 截断每层 (k, v)）
     # ------------------------------------------------------------------
+    @staticmethod
+    def _infer_device(target) -> torch.device:
+        """
+        torch.multinomial 的 generator 必须与采样张量同设备，否则 CUDA 上报
+        "Expected a 'cuda' device type for generator but found 'cpu'"。
+        """
+        try:
+            return next(target.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
     @staticmethod
     def _trim_kv(kv, keep_len: int):
         # 注意：主模型(XLLMModel)缓存的 KV 形状为 [B, seq, n_kv_heads, head_dim]，
@@ -121,6 +132,16 @@ class SpeculativeDecodingEngine:
 
         out_d = self.draft(input_ids=input_ids, use_cache=True, logits_to_keep=1)
         draft_kv = out_d.past_key_values
+        # 修正：草稿 prefill 已把 last_token 写入 KV（长度 = L），而 propose_n 会再把
+        # last_token 前向一次，导致草稿 KV 比主模型多 1、此后 RoPE 相位整体错开一位。
+        # 处理办法：草稿 prefill 只吃 input_ids[:, :-1]，让两侧 KV 长度一致 = L；
+        # propose_n 从 last_token 起步正好补齐最后一个位置。
+        if input_ids.shape[1] > 1:
+            out_d = self.draft(
+                input_ids=input_ids[:, :-1], use_cache=True, logits_to_keep=1
+            )
+            draft_kv = out_d.past_key_values
+        draft_kv_len = draft_kv[0][0].shape[1]
 
         last_token = input_ids[:, -1:]                       # [1, 1]
         ctx_len = input_ids.shape[1]                         # KV 当前长度（=已接受前缀长度）
@@ -177,8 +198,11 @@ class SpeculativeDecodingEngine:
             target_kv = out2.past_key_values
             target_last_logits = out2.logits[:, -1, :].clone()
 
-            # 6) 同步草稿 KV：同样修剪到已接受前缀，再追加压哨 token
-            draft_kv = self._trim_kv(draft_kv, keep)
+            # 6) 同步草稿 KV：修剪到已接受前缀，再追加压哨 token
+            #    修正：草稿 KV 恒定比主模型短 1（prefill 少喂了 last_token 那一位），
+            #    因此必须用 keep-1 裁剪，两侧才对得上同一个绝对位置。
+            draft_keep = keep - (full_kv[0][0].shape[1] - draft_kv[0][0].shape[1])
+            draft_kv = self._trim_kv(draft_kv, draft_keep)
             out_d = self.draft(
                 input_ids=nxt, past_key_values=draft_kv, use_cache=True, logits_to_keep=1
             )
@@ -186,6 +210,10 @@ class SpeculativeDecodingEngine:
 
             last_token = nxt
             ctx_len = keep + 1
+            assert ctx_len == target_kv[0][0].shape[1], (
+                f"主模型 KV 长度失配: ctx_len={ctx_len}, "
+                f"kv={target_kv[0][0].shape[1]}"
+            )
 
             # 统计
             self._n_iter += 1
