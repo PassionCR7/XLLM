@@ -1,0 +1,100 @@
+{
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "new_tokens": 128,
+  "results": [
+    {
+      "tag": "Dense-26M",
+      "weight": "full_sft_cot",
+      "params_m": 25.83,
+      "avg_decode_tok_s": 122.75,
+      "avg_prefill_tok_s": 1388.5,
+      "no_cache_decode_tok_s": 134.22,
+      "kv_cache_speedup": 0.91,
+      "per_prompt": [
+        {
+          "prompt": "你有什么特长？",
+          "prompt_len": 6,
+          "new_tokens": 128,
+          "prefill_tok_s": 941.664,
+          "decode_tok_s": 131.533,
+          "ttft_s": 0.014,
+          "e2e_s": 0.979
+        },
+        {
+          "prompt": "为什么天空是蓝色的",
+          "prompt_len": 8,
+          "new_tokens": 128,
+          "prefill_tok_s": 1340.056,
+          "decode_tok_s": 105.424,
+          "ttft_s": 0.014,
+          "e2e_s": 1.22
+        },
+        {
+          "prompt": "请用Python写一个计算斐波那契数列的函数",
+          "prompt_len": 15,
+          "new_tokens": 128,
+          "prefill_tok_s": 2052.32,
+          "decode_tok_s": 126.504,
+          "ttft_s": 0.015,
+          "e2e_s": 1.018
+        },
+        {
+          "prompt": "解释一下光合作用的基本过程",
+          "prompt_len": 8,
+          "new_tokens": 128,
+          "prefill_tok_s": 1219.977,
+          "decode_tok_s": 127.54,
+          "ttft_s": 0.014,
+          "e2e_s": 1.01
+        }
+      ]
+    },
+    {
+      "tag": "MoE-145M",
+      "weight": "full_sft",
+      "params_m": 95.05,
+      "avg_decode_tok_s": 60.26,
+      "avg_prefill_tok_s": 489.86,
+      "no_cache_decode_tok_s": 52.44,
+      "kv_cache_speedup": 1.15,
+      "per_prompt": [
+        {
+          "prompt": "你有什么特长？",
+          "prompt_len": 6,
+          "new_tokens": 128,
+          "prefill_tok_s": 379.298,
+          "decode_tok_s": 65.881,
+          "ttft_s": 0.031,
+          "e2e_s": 1.959
+        },
+        {
+          "prompt": "为什么天空是蓝色的",
+          "prompt_len": 8,
+          "new_tokens": 128,
+          "prefill_tok_s": 453.384,
+          "decode_tok_s": 66.436,
+          "ttft_s": 0.033,
+          "e2e_s": 1.944
+        },
+        {
+          "prompt": "请用Python写一个计算斐波那契数列的函数",
+          "prompt_len": 15,
+          "new_tokens": 128,
+          "prefill_tok_s": 754.827,
+          "decode_tok_s": 54.6,
+          "ttft_s": 0.037,
+          "e2e_s": 2.366
+        },
+        {
+          "prompt": "解释一下光合作用的基本过程",
+          "prompt_len": 8,
+          "new_tokens": 128,
+          "prefill_tok_s": 371.946,
+          "decode_tok_s": 54.134,
+          "ttft_s": 0.04,
+          "e2e_s": 2.386
+        }
+      ]
+    }
+  ]
+}

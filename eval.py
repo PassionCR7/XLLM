@@ -26,8 +26,15 @@ def init_model(args):
         )
         moe_suffix = "_moe" if hasattr(args, "use_moe") and args.use_moe else ""
         ckp = f"./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth"
+        state_dict = torch.load(ckp, map_location=args.device)
+        # 兼容旧 checkpoint：早期版本把 post_attention_layernorm 误拼为
+        # post_attention_layernotm，未规范化时 strict=True 会直接加载失败。
+        state_dict = {
+            k.replace("post_attention_layernotm", "post_attention_layernorm"): v
+            for k, v in state_dict.items()
+        }
         model.load_state_dict(
-            torch.load(ckp, map_location=args.device), strict=True
+            state_dict, strict=True
         )  # ！修正：原strict=False会静默忽略丢失/多余的权重键
 
         # # ！修正：原缺少LoRA加载逻辑
