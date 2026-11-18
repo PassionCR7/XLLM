@@ -16,7 +16,7 @@ XLLM 是一个**从零基于 PyTorch 原生实现的超轻量大语言模型项�
 - **全链路开源**：覆盖预训练、监督微调、LoRA 微调、DPO/PPO/GRPO 强化学习、Agent 工具调用、模型蒸馏（黑盒/白盒）、推测解码加速
 - **纯原生实现**：不依赖 transformers 的 Trainer/trl/peft 等高层封装，每一行核心代码均可追溯
 - **高兼容性**：支持 llama.cpp、vllm、ollama 等主流推理框架，兼容 OpenAI API 协议
-- **轻量化高性能**：核心模型为 26M 参数量级，结构对齐 Qwen3 生态
+- **轻量化高性能**：核心 Dense 模型为 25.83M 参数量级，结构对齐 Qwen3 生态
 
 ## ✨ 核心功能特性
 
@@ -83,9 +83,35 @@ python -m data_gen.cli stats                   # 语料统计
 | num_key_value_heads | 2 | KV 头数（GQA 4:1） |
 | vocab_size | 6400 | 词表大小 |
 | max_position_embeddings | 32768 | 上下文长度 |
-| 参数量 | **≈26M** | hidden=512 / 8 层时的实际规模 |
+| intermediate_size | 1408 | 未显式指定时由 `64*ceil(⌈hidden*8/3⌉/64)` 推导 |
+| 参数量 | **25.83M** | Dense，embedding 与 lm_head 共享（tied） |
+| 激活参数量 | **95.05M** | `--use_moe 1`：4 路由专家 + 1 共享专家 |
+
+#### 参数量拆解（Dense，可逐项复核）
+
+| 组成 | 计算式 | 参数量 | 占比 |
+|------|--------|--------|------|
+| Embedding（与 lm_head 共享） | 6400 × 512 | 3.28M | 12.7% |
+| 单层 Attention（GQA 4:1） | 512² + 2×(512×128) + 512² | 0.655M | — |
+| 单层 FFN（SwiGLU） | 3 × 512 × 1408 | **2.163M** | — |
+| 单层 RMSNorm ×2 | 2 × 512 | 0.001M | — |
+| 8 层合计 | 8 × 2.819M | 22.55M | 87.3% |
+| **总计** | 3.28M + 22.55M + 512 | **25.83M** | 100% |
+
+FFN 是参数主体，共 17.30M，占全模型 **67.0%**、占每个 Transformer 层的 76.7%。
+
+> 上述数字与仓库自带的 `bench_result.json` 实测记录逐位一致（Dense 25.83M / MoE 95.05M）。
+> 可用 `python count_params.py` 一键复核（不依赖 torch），或对照 `bench_speed.py`
+> 中的 `n_param = sum(p.numel() for p in model.parameters())`。
+
+> ⚠️ 历史版本 README 曾写「64M / 198M」，与代码实际结构不符。按默认配置
+> （hidden=512、8 层、vocab=6400）实测算得 25.83M；若要与 64M 对齐，
+> 需把 `hidden_size≈832` 或层数加到 22 层，这并非本仓库默认值。
 
 可通过 `--hidden_size` 与 `--num_hidden_layers` 调整规模，例如 `hidden_size=640` 配合 `--use_moe 1` 得到 MoE 变体。
+
+注意 `eval.py` 中 `--hidden_size` 的帮助文本写着「512=Small-26M, 640=MoE-145M, 768=Base-104M」，
+其中 640 档的 145M 同样与实算值（171.6M）不一致，以 `bench_result.json` 实测为准。
 
 ## 💻 环境依赖配置
 
@@ -179,6 +205,7 @@ XLLM/
 ├── eval.py                       # 推理与对话入口
 ├── bench_speed.py                # 推理速度基准（TTFT / TPOT / 吞吐）
 ├── bench_result.json             # 基准测试结果
+├── count_params.py               # 参数量核算（纯 Python，不依赖 torch）
 ├── XLLMModel.py                  # 早期单文件版本（保留兼容，新代码用 model/）
 ├── main.py                       # 占位入口
 ├── pyproject.toml                # 依赖与构建配置
@@ -334,8 +361,8 @@ LoRA 权重与基础模型合并、导出完整部署权重，逻辑见 `model/m
 ## 📈 训练成本与效率
 
 基于单卡 NVIDIA 3090 实测：
-- 26M 模型预训练 + SFT 全流程：耗时 ≈ 2.3 小时，总成本 ≈ 3 元
-- MoE 变体全流程：耗时 ≈ 3.2 小时，总成本 ≈ 4.2 元
+- 25.83M 模型预训练 + SFT 全流程：耗时 ≈ 2.3 小时，总成本 ≈ 3 元
+- MoE 变体（95.05M，4 路由 + 1 共享专家）全流程：耗时 ≈ 3.2 小时，总成本 ≈ 4.2 元
 
 ## 🧪 测试
 
