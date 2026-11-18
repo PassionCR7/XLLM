@@ -173,13 +173,18 @@ def main():
         return
 
     arch = "minimind2" if args.arch == "auto" else args.arch
+    # 指定 arch 时，未显式覆盖的维度取该世代的官方默认值，
+    # 否则 --arch minimind3 会沿用 minimind2 的 512 宽，得出无意义的数字。
+    hidden = args.hidden_size
+    if arch == "minimind3":
+        hidden = 768 if args.hidden_size == 512 else args.hidden_size
     kv = 4 if arch == "minimind3" else 2
     shared = 0 if arch == "minimind3" else 1
-    r = count(args.hidden_size, args.num_hidden_layers, args.vocab_size,
+    r = count(hidden, args.num_hidden_layers, args.vocab_size,
               num_key_value_heads=kv, use_moe=bool(args.use_moe),
               n_routed_experts=4, n_shared_experts=shared, arch=arch)
-    render(r, args.hidden_size, args.num_hidden_layers, bool(args.use_moe))
-    check(r, args.hidden_size, args.num_hidden_layers, args.use_moe)
+    render(r, hidden, args.num_hidden_layers, bool(args.use_moe))
+    check(r, hidden, args.num_hidden_layers, args.use_moe)
 
 
 if __name__ == "__main__":
