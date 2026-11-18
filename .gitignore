@@ -25,6 +25,6 @@ distillation_blackbox/data/teacher_sft.jsonl
 /.idea
 
 # 爬虫产出数据（体积随抓取增长，可由 data_gen 重新生成）
-data_gen/out/raw/
-data_gen/out/corpus/
-data_gen/out/state.json
+# 整个 out/ 一律不入库：除了体积，postings.jsonl 里还留着第三方报道的
+# 具名人物（村干部、商户），往公开仓库推等于替别人扩散个人信息。
+data_gen/out/

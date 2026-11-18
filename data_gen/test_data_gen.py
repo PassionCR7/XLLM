@@ -6,11 +6,13 @@
 
 from __future__ import annotations
 
+import os
 import sys
 
 from .crawl import clean_body, quality_ok, topic_score
 from .extract import extract_links, html_to_text, page_title
-from .build_corpus import _normalize_body, _simhash, _hamming
+from .posting import fact_ok, overlap_ratio
+from .build_corpus import _normalize_body, _simhash, _hamming, rebuild_from_postings
 
 
 def _check(name: str, cond: bool, detail: str = "") -> bool:
@@ -133,6 +135,203 @@ def test_topic_reject_local_news() -> bool:
     return ok
 
 
+def test_fact_check_catches_fabrication() -> bool:
+    """坑 4：模型会编造价格，必须能抓出来。
+
+    实测来源：LLM 改写满觉陇赏桂稿时，原文只写「沿路有茶室」，
+    模型补出「人均八十元」。假价格进了预训练语料会被当知识学走。
+    """
+    origin = "满觉陇是杭州赏桂地，沿路有茶室，建议早上八点前到。"
+    ok = True
+    ok &= _check("编造价格被抓",
+                 not fact_ok(origin, "茶室人均八十元，八点前到。")[0])
+    ok &= _check("编造两个价格被抓",
+                 not fact_ok(origin, "人均八十元，停车二十块。")[0])
+    ok &= _check("保留原文数字放行",
+                 fact_ok(origin, "沿路十几家茶室，八点前到。")[0])
+    ok &= _check("数字都对放行",
+                 fact_ok("活动到12月13日，24家单位参与，门票50元",
+                         "办到12月13日，24家单位都来，门票50元")[0])
+    return ok
+
+
+def test_fact_check_no_false_positive() -> bool:
+    """坑 5：事实核查误杀——「一」被当成数字。
+
+    实测事故：首版把 个/家/人/位 也当单位，导致「一个人去」「三场大集」
+    全被判编造数字，9/20 篇正常稿件被拒。修法：「一」单独出现一律不算，
+    单位只保留金额/时长/距离。
+    """
+    origin = "杭州城市音乐客厅试营业，馆藏黑胶唱片5000余张。"
+    rewritten = ("一个人去御街逛，正好碰上城市音乐客厅试营业，"
+                 "5000多张黑胶唱片，能待一上午。")
+    ok = _check("「一个人」不触发误杀", fact_ok(origin, rewritten)[0])
+    ok &= _check("「一场」不触发误杀",
+                 fact_ok("满觉陇桂花开了", "看了一场桂花雨，香得很。")[0])
+    ok &= _check("「三场大集」不触发误杀",
+                 fact_ok("农交会在杭州举办", "连逛三场大集，一次逛完。")[0])
+    return ok
+
+
+def test_overlap_detects_copy() -> bool:
+    """坑 6：模型可能直接抄原文，失去改写意义。"""
+    o = "杭州西溪湿地芦花开了，秋雪庵是核心观赏点，周末有游园会。"
+    ok = _check("抄原文重合率高", overlap_ratio(o, o) > 0.9)
+    ok &= _check("改写后重合率低",
+                 overlap_ratio(o, "风一吹芦花像雪，我去看了，人不少。") < 0.2)
+    return ok
+
+
+def test_postings_dedup() -> bool:
+    """坑 7：--force 重跑会产生同一原文的多个版本。
+
+    实测：25 篇原文被改写成 39 条，语料里同一事件出现 2~3 次。
+    rebuild_from_postings 要按 origin_title 合并。
+    """
+    import json as _json
+    import tempfile
+
+    rows = [
+        {"origin_title": "A篇", "title": "打卡A-旧", "text": "第一版内容" * 8},
+        {"origin_title": "A篇", "title": "打卡A-新", "text": "第二版内容" * 8},
+        {"origin_title": "B篇", "title": "打卡B", "text": "另一个地方" * 8},
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        pp = os.path.join(td, "p.jsonl")
+        out = os.path.join(td, "c.jsonl")
+        with open(pp, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(_json.dumps(r, ensure_ascii=False) + "\n")
+        s = rebuild_from_postings(pp, out)
+        n = sum(1 for line in open(out, encoding="utf-8") if line.strip())
+        ok = _check("同原文只保留一条", s["uniq_origin"] == 2 and n == 2,
+                    f"uniq={s['uniq_origin']} lines={n}")
+        # 保留的是后写入的版本
+        first = _json.loads(open(out, encoding="utf-8").readline())
+        ok &= _check("保留最新版本", "打卡A-新" in first["text"],
+                     f"got={first['text'][:20]}")
+    return ok
+
+
+def test_rebuild_keeps_originals() -> bool:
+    """坑 8：rebuild 默认必须「补充」而不是「替换」。
+
+    实测事故：首版 keep_original 默认 False，rebuild 之后语料从 21,828 字
+    掉到 7,294 字——打卡帖把原文顶掉了，语料量缩水 2/3。用户要的是
+    「补充 corpus.jsonl」，语料只应增加。打卡帖与通稿是两种文体，
+    同时保留才能让模型学到叙述与体验两套表达。
+    """
+    import json as _json
+    import tempfile
+
+    posting = {"origin_title": "西溪芦花", "title": "打卡西溪",
+               "text": "风过芦花像雪，我去看了。" * 8}
+    original = {"text": "西溪听芦节启幕。\n" + "秋雪庵是核心观赏点。" * 10}
+    with tempfile.TemporaryDirectory() as td:
+        pp = os.path.join(td, "p.jsonl")
+        out = os.path.join(td, "c.jsonl")
+        with open(pp, "w", encoding="utf-8") as f:
+            f.write(_json.dumps(posting, ensure_ascii=False) + "\n")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(_json.dumps(original, ensure_ascii=False) + "\n")
+        s = rebuild_from_postings(pp, out)          # 用默认参数
+        lines = [l for l in open(out, encoding="utf-8") if l.strip()]
+        ok = _check("默认保留原文", len(lines) == 2, f"lines={len(lines)}")
+        ok &= _check("原文确实还在",
+                     any("秋雪庵是核心观赏点" in l for l in lines))
+        ok &= _check("打卡帖也进来了",
+                     any("风过芦花像雪" in l for l in lines))
+    return ok
+
+
+def test_no_key_leak() -> bool:
+    """坑 11：API key 会经 repr / 错误信息泄露到终端。
+
+    实测两处：
+      1. LLMClient 是 dataclass，api_key 字段默认进 __repr__，
+         print(client) 或 traceback 里的局部变量展示会打出
+         api_key='sk-xxx'。只给 _cfg/_key 加 repr=False 不够，
+         构造入参必须单独排除。
+      2. chat() 把 HTTPError 响应体拼进 LLMError，而 cli.py 会直接
+         print 到终端。网关出错时会回显请求头，key 就跟着出去了。
+    终端会进 CI 日志、会被截图、会被贴进 issue，必须脱敏。
+    """
+    from .llm import LLMClient, redact
+
+    secret = "sk-testsecret1234567890abcdef"
+    c = LLMClient(api_base="https://x/v1", api_key=secret, model_id="m")
+    ok = _check("repr 不含 key", secret not in repr(c), f"repr={c!r}")
+    ok &= _check("str 不含 key", secret not in str(c))
+
+    # 响应体回显 / Bearer 头回显都要打码
+    leaked = f'HTTP 401 {{"error":"invalid key {secret}"}}'
+    ok &= _check("错误响应体里的 key 被打码",
+                 secret not in redact(leaked, secret), f"got={redact(leaked, secret)}")
+    ok &= _check("Bearer 后的 key 被打码",
+                 secret not in redact(f"Authorization: Bearer {secret}", secret))
+
+    # 不能误伤：URL、普通错误、长数字串必须原样保留
+    for s in ["https://api.example.com/v1/chat/completions",
+              "HTTP 500 Internal Server Error",
+              "订单号 20261119000123456789"]:
+        ok &= _check(f"不误伤: {s[:22]}", redact(s, secret) == s, f"got={redact(s, secret)}")
+    return ok
+
+
+def test_scrub_idempotent() -> bool:
+    """坑 10：脱敏必须幂等，重复跑不能把句子改坏。
+
+    实测事故：先在已脱敏的语料上再 rebuild 一次，姓名池为空，
+    「经营者顾大姐，客人都称她顾妈」被替换成「经营者他，客人都称她顾妈」——
+    他/她混用，成了病句。原因是脱敏依赖姓名池，而姓名池只能从**原始**
+    文本收集，从已脱敏文本收不到。规范流程是先 build(raw) 再 rebuild。
+    """
+    from .build_corpus import scrub_pii
+
+    once = scrub_pii("满觉陇村党委副书记陈骏辰说，人很多。")
+    twice = scrub_pii(once)
+    ok = _check("二次脱敏不改动已脱敏文本", once == twice, f"{once!r} != {twice!r}")
+
+    # 带姓名池时也不能产生「他他」「他，」这类残句
+    pool = {"顾大姐"}
+    s1 = scrub_pii("经营者顾大姐，客人都称她顾妈。", pool)
+    ok &= _check("姓名后接标点时整段删除",
+                 s1 == "经营者，客人都称她顾妈。", f"got={s1!r}")
+    s2 = scrub_pii("叶顺虎是77届农校生。", {"叶顺虎"})
+    ok &= _check("姓名后接动词时用「他」占位", s2 == "他是77届农校生。",
+                 f"got={s2!r}")
+    return ok
+
+
+def test_pii_scrubbed() -> bool:
+    """坑 9：语料里留着真实姓名 = 替别人扩散个人信息。
+
+    新闻稿里「副书记陈骏辰说」本来是公开的，但喂进预训练语料是另一回事：
+    模型会把「真实姓名 + 真实职务」记成知识，生成时凭空造一句真人言论。
+    出口必须脱敏。同时手机号/身份证号绝不允许进语料。
+    """
+    from .build_corpus import scrub_pii
+
+    ok = _check("职务+姓名被去掉",
+                scrub_pii("满觉陇村党委副书记陈骏辰说，人很多。")
+                == "满觉陇村党委副书记说，人很多。")
+    ok &= _check("村书记+姓名被去掉",
+                 "汪国建" not in scrub_pii("村书记汪国建从社区出发。"))
+    ok &= _check("署名行整行删除",
+                 "管光前" not in scrub_pii("记者 管光前 临安微融圈\n正文在此。"))
+    ok &= _check("手机号被脱敏",
+                 "13812345678" not in scrub_pii("电话13812345678"))
+    ok &= _check("身份证号被脱敏",
+                 "330102199001011234" not in scrub_pii("证号330102199001011234"))
+    # 不能误伤：只给姓的匿名写法本来就是新闻惯例，注释和职务介绍也不能删
+    ok &= _check("「陈先生」保留",
+                 "陈先生" in scrub_pii("游客陈先生带着爱人来了。"))
+    ok &= _check("「负责人介绍」不误伤",
+                 scrub_pii("负责人介绍情况时说，活动到月底。")
+                 == "负责人介绍情况时说，活动到月底。")
+    return ok
+
+
 def test_footer_stripped() -> bool:
     """坑 3：页脚 ICP 备案信息被当作正文收进来。
 
@@ -190,6 +389,14 @@ def main() -> int:
         test_topic_reject_foreign_city,
         test_topic_accept_local,
         test_topic_reject_local_news,
+        test_fact_check_catches_fabrication,
+        test_fact_check_no_false_positive,
+        test_overlap_detects_copy,
+        test_postings_dedup,
+        test_rebuild_keeps_originals,
+        test_pii_scrubbed,
+        test_no_key_leak,
+        test_scrub_idempotent,
         test_footer_stripped,
         test_simhash_dedup,
         test_quality_gate,
