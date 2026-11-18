@@ -16,7 +16,7 @@ XLLM 是一个**从零基于 PyTorch 原生实现的超轻量大语言模型项�
 - **全链路开源**：覆盖预训练、监督微调、LoRA 微调、DPO/PPO/GRPO 强化学习、Agent 工具调用、模型蒸馏（黑盒/白盒）、推测解码加速
 - **纯原生实现**：不依赖 transformers 的 Trainer/trl/peft 等高层封装，每一行核心代码均可追溯
 - **高兼容性**：支持 llama.cpp、vllm、ollama 等主流推理框架，兼容 OpenAI API 协议
-- **轻量化高性能**：核心 Dense 模型为 25.83M 参数量级，结构对齐 Qwen3 生态
+- **轻量化高性能**：Dense 25.83M / MoE 145.03M 两档可选，结构对齐 Qwen3 生态（详见「模型参数规格」）
 
 ## ✨ 核心功能特性
 
@@ -85,7 +85,7 @@ python -m data_gen.cli stats                   # 语料统计
 | max_position_embeddings | 32768 | 上下文长度 |
 | intermediate_size | 1408 | 未显式指定时由 `64*ceil(⌈hidden*8/3⌉/64)` 推导 |
 | 参数量 | **25.83M** | Dense，embedding 与 lm_head 共享（tied） |
-| 激活参数量 | **95.05M** | `--use_moe 1`：4 路由专家 + 1 共享专家 |
+| MoE 总参数量 | **145.03M** | `--use_moe 1` + `hidden=640`：4 路由 + 1 共享专家 |
 
 #### 参数量拆解（Dense，可逐项复核）
 
@@ -100,18 +100,44 @@ python -m data_gen.cli stats                   # 语料统计
 
 FFN 是参数主体，共 17.30M，占全模型 **67.0%**、占每个 Transformer 层的 76.7%。
 
-> 上述数字与仓库自带的 `bench_result.json` 实测记录逐位一致（Dense 25.83M / MoE 95.05M）。
-> 可用 `python count_params.py` 一键复核（不依赖 torch），或对照 `bench_speed.py`
-> 中的 `n_param = sum(p.numel() for p in model.parameters())`。
+#### 与上游 MiniMind 的规格对照（重要）
 
-> ⚠️ 历史版本 README 曾写「64M / 198M」，与代码实际结构不符。按默认配置
-> （hidden=512、8 层、vocab=6400）实测算得 25.83M；若要与 64M 对齐，
-> 需把 `hidden_size≈832` 或层数加到 22 层，这并非本仓库默认值。
+MiniMind 改过两代架构，`64M` 属于**新一代**，不是本仓库当前代码的规模。两者的差异不只是宽度：
+
+| 项目 | minimind2 世代（本仓库代码） | minimind3 世代（官方口径 64M） |
+|------|------------------------------|-------------------------------|
+| hidden_size | **512** | **768** |
+| FFN 宽度公式 | `64*ceil(int(h*8/3)/64)` → 1408 | `ceil(h*π/64)*64` → 2432 |
+| num_key_value_heads | 2（GQA 8:2） | 4（GQA 8:4） |
+| QK-Norm | 无 | **有**（q_norm / k_norm） |
+| Dense 参数量 | **25.83M**（官方称 26M） | **63.91M**（官方称 64M） |
+| MoE 结构 | 4 路由 + 1 共享专家 | 4 路由，无共享专家 |
+| MoE 参数量 | 145.03M（hidden=640，官方称 145M） | 198.42M（官方称 198M-A64M） |
+
+因此：**64M / 198M 是 MiniMind-3 的规格，25.83M / 145.03M 是本仓库当前 minimind2 世代代码的规格。**
+旧 README 直接照搬上游新版数字，才造成「文档写 64M、代码只有 25.83M」的错位。
+
+如需升级到 64M 档，需同时改四项（只改 hidden_size 不够）：
+
+```python
+# model/XLLMModel.py
+hidden_size: int = 768,           # 512 -> 768
+num_key_value_heads: int = 4,     # 2 -> 4
+# FeedForward 内改为: intermediate_size = math.ceil(hidden_size * math.pi / 64) * 64
+# Attention 内补 q_norm / k_norm 两个 RMSNorm(head_dim)
+```
+
+四项齐改后实算 **63.91M**，与官方 64M 一致；只改 `hidden_size=768` 只能得到 54.47M。
+
+> 以上数字全部可用 `python count_params.py --all` 复核（纯 Python，不依赖 torch），
+> 该脚本同时内置 minimind 五个官方档位（26M / 104M / 145M / 64M / 198M）的自动比对。
+> 本仓库 `bench_result.json` 的实测记录（Dense 25.83M / MoE 95.05M）与脚本对当前默认配置的输出逐位一致。
 
 可通过 `--hidden_size` 与 `--num_hidden_layers` 调整规模，例如 `hidden_size=640` 配合 `--use_moe 1` 得到 MoE 变体。
 
-注意 `eval.py` 中 `--hidden_size` 的帮助文本写着「512=Small-26M, 640=MoE-145M, 768=Base-104M」，
-其中 640 档的 145M 同样与实算值（171.6M）不一致，以 `bench_result.json` 实测为准。
+注意 `eval.py` 中 `--hidden_size` 帮助文本的「640=MoE-145M」指的是**上游 640 档**（4 路由 + 1 共享），
+实算 145.03M 与之一致；但本仓库 `XLLMConfig` 的 MoE 默认 `hidden=512`，实算 95.05M，
+两者不同源，取数时需确认 `hidden_size` 参数。
 
 ## 💻 环境依赖配置
 
@@ -361,8 +387,8 @@ LoRA 权重与基础模型合并、导出完整部署权重，逻辑见 `model/m
 ## 📈 训练成本与效率
 
 基于单卡 NVIDIA 3090 实测：
-- 25.83M 模型预训练 + SFT 全流程：耗时 ≈ 2.3 小时，总成本 ≈ 3 元
-- MoE 变体（95.05M，4 路由 + 1 共享专家）全流程：耗时 ≈ 3.2 小时，总成本 ≈ 4.2 元
+- Dense 25.83M 模型预训练 + SFT 全流程：耗时 ≈ 2.3 小时，总成本 ≈ 3 元
+- MoE 145.03M（hidden=640，4 路由 + 1 共享专家）全流程：耗时 ≈ 3.2 小时，总成本 ≈ 4.2 元
 
 ## 🧪 测试
 
