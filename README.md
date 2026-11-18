@@ -2,7 +2,7 @@
 
 **基于轻量小模型从零复现的大语言模型项目，低成本、全流程可落地、适合 LLM 入门实战学习**
 
-⭐ 本项目为个人学习复现项目，基于 [minimind](https://github.com/jingyaogong/minimind) 和 [MokioMind](https://github.com/Wood-Q/MokioMind) 开源项目二次学习重构实现，完整复刻小参数 LLM 全链路训练、微调、强化学习、工具调用、模型蒸馏与推理加速能力。
+⭐ 本项目为个人学习复现项目，基于 [minimind](https://github.com/jingyaogong/minimind) 开源项目二次学习重构实现，完整复刻小参数 LLM 全链路训练、微调、强化学习、工具调用、模型蒸馏与推理加速能力。
 
 ## 📖 项目介绍
 
